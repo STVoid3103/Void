@@ -112,20 +112,32 @@ def udiff_url(date: pd.Timestamp) -> str:
            f"BhavCopy_NSE_FO_0_0_0_{date.strftime('%Y%m%d')}_F_0000.csv.zip")
 
 
-def _download_zip_csv(session: requests.Session, url: str) -> pd.DataFrame | None:
-    try:
-        r = session.get(url, timeout=30)
-        if r.status_code != 200 or len(r.content) < 200:
-            return None
-        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-            names = z.namelist()
-            if not names:
-                return None
-            with z.open(names[0]) as f:
-                return pd.read_csv(f)
-    except Exception as e:
-        print(f"    fetch failed: {str(e)[:80]}")
-        return None
+class NseNotFound(Exception):
+    """A confirmed 404 -- the archive file genuinely doesn't exist for this
+    date. Almost always a market holiday, not a network/blocking problem.
+    Retrying this would only burn time for no chance of success, so callers
+    should give up on it immediately rather than run it through the normal
+    4-attempt/15s retry loop meant for transient or block-related failures."""
+
+
+def _download_zip_csv(session: requests.Session, url: str) -> pd.DataFrame:
+    """Returns the parsed bhavcopy DataFrame, or raises: NseNotFound for a
+    confirmed 404 (don't retry -- see above), or a plain Exception with a
+    real reason (timeout, connection error, non-200/404 status, empty/
+    malformed response) for anything worth retrying."""
+    r = session.get(url, timeout=30)
+    if r.status_code == 404:
+        raise NseNotFound("HTTP 404 -- no file for this date (likely a market holiday)")
+    if r.status_code != 200:
+        raise Exception(f"HTTP {r.status_code}")
+    if len(r.content) < 200:
+        raise Exception(f"response too short ({len(r.content)} bytes) -- likely blocked or malformed")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        names = z.namelist()
+        if not names:
+            raise Exception("zip file has no entries")
+        with z.open(names[0]) as f:
+            return pd.read_csv(f)
 
 
 def parse_legacy(df: pd.DataFrame, date: pd.Timestamp) -> pd.DataFrame:
@@ -195,14 +207,14 @@ def main():
     ap.add_argument("--end", default=pd.Timestamp.now().strftime("%Y-%m-%d"))
     args = ap.parse_args()
 
-    trading_days = pd.bdate_range(args.start, args.end)  # weekday approx; NSE holidays just get empty/failed responses, skipped
+    trading_days = pd.bdate_range(args.start, args.end)  # weekday approx; NSE holidays hit a real 404, handled below
     print(f"NIFTY index options pull: {trading_days[0].date()} -> {trading_days[-1].date()} "
          f"({len(trading_days)} candidate weekdays)")
     print(f"Legacy format through 2024-07-05, UDiFF format from 2024-07-08 onward")
     print(f"Checkpoint file: {CHECKPOINT_FILE}")
 
     session = _nse_session()
-    n_saved, n_skipped, n_failed, n_empty = 0, 0, 0, 0
+    n_saved, n_skipped, n_failed, n_empty, n_holiday = 0, 0, 0, 0, 0
 
     for date in trading_days:
         date_str = date.strftime("%Y-%m-%d")
@@ -214,22 +226,31 @@ def main():
         parser = parse_legacy if date < UDIFF_CUTOVER else parse_udiff
 
         df = None
+        is_holiday = False
         for attempt in range(4):
-            raw = _download_zip_csv(session, url)
-            if raw is not None:
+            try:
+                raw = _download_zip_csv(session, url)
                 df = parser(raw, date)
                 break
-            print(f"  {date_str}: attempt {attempt + 1}/4 failed, retrying in 15s...")
-            time.sleep(15)
-            session = _nse_session()  # re-prime cookies
+            except NseNotFound as e:
+                print(f"  {date_str}: {e} -- not retrying (a 404 won't succeed on retry)")
+                is_holiday = True
+                break
+            except Exception as e:
+                print(f"  {date_str}: attempt {attempt + 1}/4 failed ({str(e)[:100]}), retrying in 15s...")
+                if attempt < 3:
+                    time.sleep(15)
+                    session = _nse_session()  # re-prime cookies
 
-        if df is None:
-            print(f"  {date_str}: FAILED after 4 attempts (likely a holiday, or genuinely blocked -- "
-                 f"checkpointed as done either way so a re-run doesn't loop on it forever; "
-                 f"re-run with --start {date_str} if you want to retry it specifically)")
+        if is_holiday:
+            n_holiday += 1
+        elif df is None:
+            print(f"  {date_str}: FAILED after 4 attempts (genuinely blocked or a persistent error -- "
+                 f"see the reasons printed above; checkpointed as done either way so a re-run doesn't "
+                 f"loop on it forever; re-run with --start {date_str} if you want to retry it specifically)")
             n_failed += 1
         elif df.empty:
-            print(f"  {date_str}: no NIFTY index option rows found (probably a market holiday)")
+            print(f"  {date_str}: file downloaded fine but had no NIFTY index option rows")
             n_empty += 1
         else:
             df.to_csv(OUT_FILE, mode="a", header=not os.path.exists(OUT_FILE), index=False)
@@ -241,7 +262,7 @@ def main():
         time.sleep(0.5)  # be a bit gentle on NSE's archive server
 
     print(f"\nDone. saved={n_saved} skipped(already had)={n_skipped} "
-         f"failed/holiday={n_failed} empty={n_empty}")
+         f"holiday(404)={n_holiday} failed={n_failed} empty={n_empty}")
     print(f"Output: {OUT_FILE}")
     print(f"Send that file back, plus this console output (especially any [CHECK] lines) so I can "
          f"confirm the UDiFF instrument-type filter matched real data correctly.")
